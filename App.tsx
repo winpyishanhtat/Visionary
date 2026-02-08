@@ -1,9 +1,10 @@
+
 import { useState } from 'react';
 import { Eye, Sparkle, Copy } from 'phosphor-react';
 import { MediaInput } from './components/MediaInput';
 import { Visualizer } from './components/Visualizer';
 import { ErrorBanner } from './components/ErrorBanner';
-import { apiAnalyzeAndDetect, apiTranslate, apiGenerateSpeech } from './services/geminiService';
+import { apiAnalyzeAndDetect, apiGenerateSpeech } from './services/geminiService';
 import { AppStatus, ResultsMap } from './types';
 
 function App() {
@@ -59,66 +60,67 @@ function App() {
         setErrorMessage(null);
 
         try {
-            // 1. Vision Analysis
+            // 1. Vision Analysis (Rules 1-8 logic in service)
             const analysis = await apiAnalyzeAndDetect(fileData, mimeType);
-            const fullNarrative = analysis.text;
             
             const newResults: ResultsMap = {};
-            newResults['en-original'] = {
-                label: 'Original (Mixed + English Description)',
-                text: fullNarrative,
+            
+            // 1a. Primary Content (The Source Language Tag: OCR + Description)
+            // If it's pure visual (en), analysis.primaryLabel will be "English"
+            const primaryKey = analysis.detectedLanguage === 'unknown' ? 'main' : analysis.detectedLanguage;
+            
+            newResults[primaryKey] = {
+                label: `${analysis.primaryLabel} (Source)`,
+                text: analysis.primaryContent,
                 audioBlob: null
             };
 
-            // 2. Translation
-            const detectedLangs = analysis.detectedLangs;
-            
-            for (const langCode of detectedLangs) {
-                if (langCode === 'en') continue;
-                setStatusText(`Translating narrative to ${langCode}...`);
-                const translated = await apiTranslate(fullNarrative, langCode);
-                const langName = new Intl.DisplayNames(['en'], { type: 'language' }).of(langCode) || langCode;
-                newResults[langCode] = {
-                    label: `${langName} (Full Translation)`,
-                    text: translated,
+            // 1b. Translations
+            if (analysis.translations.en) {
+                newResults['en'] = {
+                    label: 'English (Translation)',
+                    text: analysis.translations.en,
+                    audioBlob: null
+                };
+            }
+            if (analysis.translations.my) {
+                newResults['my'] = {
+                    label: 'Burmese (Translation)',
+                    text: analysis.translations.my,
                     audioBlob: null
                 };
             }
 
-            // Fallback to Spanish if no languages detected
-            if (detectedLangs.length === 0) {
-                 setStatusText('Translating to Spanish (fallback)...');
-                 const esText = await apiTranslate(fullNarrative, 'es');
-                 newResults['es'] = {
-                     label: 'Spanish (Full Translation)',
-                     text: esText,
-                     audioBlob: null
-                 };
-            }
-
             setResultsMap(newResults);
 
-            // 3. Generate Speech for all
+            // 2. Generate Speech for each tab independently
+            // Requirement: Send Full text (OCR+Description formatted as a one passage) to the Voice Model 
+            // for both source and translated languages respectively.
+            
             const keys = Object.keys(newResults);
             
             for (const key of keys) {
                 const item = newResults[key];
-                setStatusText(`Generating speech for "${item.label}"...`);
+                if (!item.text) continue;
+
+                // Send the specific text for this language (OCR+Description) to the voice model
+                const textForSpeech = item.text;
+
+                setStatusText(`Generating audio for ${item.label}...`);
                 try {
-                    const blob = await apiGenerateSpeech(item.text);
+                    const blob = await apiGenerateSpeech(textForSpeech);
                     newResults[key].audioBlob = blob;
-                    // Update state to show progress
+                    // Update state incrementally
                     setResultsMap({ ...newResults });
                 } catch (e: any) {
                     console.warn(`Failed to generate speech for ${key}:`, e.message);
-                    // We don't abort the whole workflow for speech failure, just log it
                 }
             }
 
             // Finish
-            const defaultKey = keys[0] || 'en-original';
-            setSelectedLanguage(defaultKey);
-            selectLanguage(defaultKey, newResults);
+            // Default to primary key
+            setSelectedLanguage(primaryKey);
+            selectLanguage(primaryKey, newResults);
             setStatus('idle');
             setStatusText('Ready');
             
@@ -134,7 +136,7 @@ function App() {
         setSelectedLanguage(key);
         const item = map[key];
         
-        // Stop current audio
+        // Always stop current audio when switching tabs
         if (audioElement) {
             audioElement.pause();
             setAudioElement(null);
@@ -150,21 +152,43 @@ function App() {
                 setStatusText('Finished');
             };
             setAudioElement(audio);
-            // Auto play
-            audio.play().then(() => {
-                setIsPlaying(true);
-                setStatus('playing');
-                setStatusText('Speaking...');
-            }).catch(e => console.log("Playback error", e));
+            // We do not auto-play on tab switch, only on initial load (handled implicitly via selectLanguage call in processWorkflow)
+            // However, since selectLanguage is called at the end of processWorkflow, it will set the audio.
+            // We can check if status is processing/analyzing to trigger auto-play if needed, or just let user play.
+            // To match previous behavior of auto-playing the first result:
+            if (status === 'processing' || statusText === 'Ready') {
+                 audio.play().then(() => {
+                    setIsPlaying(true);
+                    setStatus('playing');
+                    setStatusText('Speaking...');
+                 }).catch(e => console.log("Auto-play blocked or failed", e));
+            }
         } else {
-             // If we selected a language but audio failed/is missing
-             setStatus('idle');
-             setStatusText('Idle (No Audio)');
+             setAudioElement(null);
         }
     };
 
     const togglePlayback = () => {
-        if (!audioElement) return;
+        if (!audioElement) {
+            // Re-create if missing (e.g. after stop)
+            const item = selectedLanguage ? resultsMap[selectedLanguage] : null;
+            if (item && item.audioBlob) {
+               const url = URL.createObjectURL(item.audioBlob);
+               const audio = new Audio(url);
+               audio.onended = () => {
+                   setIsPlaying(false);
+                   setStatus('idle');
+                   setStatusText('Finished');
+               };
+               setAudioElement(audio);
+               audio.play();
+               setIsPlaying(true);
+               setStatus('playing');
+               setStatusText('Speaking...');
+            }
+            return;
+        }
+
         if (audioElement.paused) {
             audioElement.play();
             setIsPlaying(true);
@@ -246,14 +270,16 @@ function App() {
 
                 {/* Results Area */}
                 {Object.keys(resultsMap).length > 0 && currentResult && (
-                    <div className="glass-panel rounded-2xl p-6 border-l-4 border-l-primary">
+                    <div className="glass-panel rounded-2xl p-6 border-l-4 border-l-primary animate-fade-in-down">
                         <div className="flex justify-between items-center mb-3">
-                            <span className="text-xs font-bold text-primary uppercase tracking-widest">AI Analysis</span>
+                            <span className="text-xs font-bold text-primary uppercase tracking-widest">
+                                {currentResult.label}
+                            </span>
                             <div className="flex items-center gap-4">
                                 <select 
                                     value={selectedLanguage || ''} 
                                     onChange={(e) => selectLanguage(e.target.value)}
-                                    className="bg-slate-800 border border-slate-700 rounded-md px-2 py-1 text-xs text-white focus:border-primary outline-none"
+                                    className="bg-slate-800 border border-slate-700 rounded-md px-2 py-1 text-xs text-white focus:border-primary outline-none max-w-[150px]"
                                 >
                                     {Object.keys(resultsMap).map(key => (
                                         <option key={key} value={key}>{resultsMap[key].label}</option>
@@ -264,12 +290,19 @@ function App() {
                                 </button>
                             </div>
                         </div>
-                        <p className="text-sm text-slate-300 leading-relaxed font-sans whitespace-pre-wrap max-h-48 overflow-y-auto scrollbar-hide">
+                        <p className="text-sm text-slate-300 leading-relaxed font-sans whitespace-pre-wrap max-h-64 overflow-y-auto scrollbar-hide">
                             {currentResult.text}
                         </p>
-                        <div className="mt-4 text-right">
-                            <p className="text-[10px] text-slate-400 uppercase tracking-wider">Voice Model</p>
-                            <p className="text-xs font-bold text-purple-300">gemini-2.5-flash-preview-tts (Kore)</p>
+                        <div className="mt-4 text-right border-t border-white/5 pt-2">
+                            <div className="flex justify-between items-center">
+                                <span className="text-[10px] text-slate-500">
+                                    {resultsMap[selectedLanguage || '']?.audioBlob ? "Audio Ready" : "Text Only"}
+                                </span>
+                                <div>
+                                    <p className="text-[10px] text-slate-400 uppercase tracking-wider">Voice Model</p>
+                                    <p className="text-xs font-bold text-purple-300">gemini-2.5-flash-tts (Kore)</p>
+                                </div>
+                            </div>
                         </div>
                     </div>
                 )}
