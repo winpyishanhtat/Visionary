@@ -1,0 +1,8 @@
+{
+  "name": "Visionary",
+  "description": "A vision assistant that analyzes documents, translates content, and narrates it using Gemini AI.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
