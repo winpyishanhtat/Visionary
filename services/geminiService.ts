@@ -3,18 +3,16 @@ import { pcmToWav } from "../utils/audioUtils";
 import { AnalysisResponse } from "../types";
 
 const CONFIG = {
-    visionModel: 'gemini-3-flash-preview', // Recommended for OCR/Vision
+    visionModel: 'gemini-3-flash-preview', // Optimized for vision/OCR tasks
     translationModel: 'gemini-3-flash-preview',
-    audioModel: 'gemini-2.5-flash-preview-tts', // Corrected model string
+    audioModel: 'gemini-2.5-flash-preview-tts',
 };
 
 const MAX_RETRIES = 3;
 const INITIAL_BACKOFF = 1000;
 
 const getClient = (apiKey: string | undefined, keyName: string) => {
-    if (!apiKey) {
-        throw new Error(`${keyName} is missing. Please check your .env file.`);
-    }
+    if (!apiKey) throw new Error(`${keyName} is missing.`);
     return new GoogleGenAI(apiKey);
 };
 
@@ -23,11 +21,9 @@ async function withRetry<T>(operation: () => Promise<T>, retries = MAX_RETRIES, 
         return await operation();
     } catch (error: any) {
         const status = error?.status || error?.response?.status;
-        const message = error?.message || '';
-        const isRetryable = status === 429 || status === 503 || message.includes('429') || message.includes('quota');
-
+        const isRetryable = status === 429 || status === 503;
         if (isRetryable && retries > 0) {
-            await new Promise(resolve => setTimeout(resolve, delay));
+            await new Promise(res => setTimeout(res, delay));
             return withRetry(operation, retries - 1, delay * 2);
         }
         throw error;
@@ -42,97 +38,89 @@ export const apiAnalyzeAndDetect = async (
         const ai = getClient(process.env.GEMINI_FLASH_API_KEY, 'GEMINI_FLASH_API_KEY');
         const model = ai.getGenerativeModel({ model: CONFIG.visionModel });
 
-        // Revised Prompt: Forces analysis into the image's own dominant language
-        const systemPrompt = `Analyze the image and perform the following:
-1. DETECT: Identify the languages used in the image text. Provide the top 2 ISO codes.
-2. OCR: Extract all text visible in the image.
-3. DESCRIBE: Provide a brief visual description (max 2 sentences).
-4. LANGUAGE MATCH: Write both the OCR text and the visual description in the MOST USED language detected in the image.
+        const systemPrompt = `Analyze the image and follow these strict rules:
+        1. DETECT: List ISO language codes for text found. Max 3. If more than 3, return "ERROR: Too many languages".
+        2. IF NO TEXT: Tag as [VISUAL_ONLY]. Provide brief English description.
+        3. IF 1 LANG (EN): Tag as [SINGLE_EN]. Provide OCR text + English description.
+        4. IF 1 LANG (Non-EN): Tag as [SINGLE_NON_EN]. Provide OCR text + description in that language.
+        5. IF 2-3 LANGS: Tag as [MULTILINGUAL]. 
+           - Identify the most used (dominant) language.
+           - List "ORIGINAL_TEXT": [The text exactly as it appears].
+           - List "DOMINANT_BLOCK": [The text as it appears, but with non-dominant languages translated inline to the dominant language] + [A description in the dominant language].
 
-Output strictly in this format:
-LANG_CODES: [code1, code2]
-NARRATIVE:
-[OCR Text and Visual Description in the dominant language]`;
+        Output Format:
+        LANG_CODES: [code1, code2]
+        TYPE: [VISUAL_ONLY / SINGLE_EN / SINGLE_NON_EN / MULTILINGUAL]
+        NARRATIVE:
+        [Your content based on the rules above]`;
 
-        const result = await model.generateContent([
+        const response = await model.generateContent([
             systemPrompt,
-            {
-                inlineData: {
-                    mimeType: mimeType,
-                    data: base64Data
-                }
-            }
+            { inlineData: { mimeType, data: base64Data } }
         ]);
 
-        const rawText = result.response.text();
-
+        const rawText = response.response.text();
         const langCodesMatch = rawText.match(/LANG_CODES:\s*\[([^\]]*)\]/);
+        const typeMatch = rawText.match(/TYPE:\s*(\w+)/);
         const narrativeMatch = rawText.match(/NARRATIVE:\s*([\s\S]*)/);
 
-        let detectedLangs: string[] = [];
-        if (langCodesMatch && langCodesMatch[1]) {
-            detectedLangs = langCodesMatch[1]
-                .split(',')
-                .map(code => code.trim().toLowerCase())
-                .filter(code => code !== "")
-                .slice(0, 2); // Only take top 2
+        let detectedLangs = langCodesMatch?.[1].split(',').map(s => s.trim().toLowerCase()).filter(Boolean) || [];
+        const type = typeMatch?.[1] || "";
+        let finalNarrative = narrativeMatch?.[1].trim() || rawText;
+
+        // Validation: Reject more than 3 languages
+        if (detectedLangs.length > 3) throw new Error("More than 3 languages detected. Process stopped.");
+
+        /** 
+         * LOGIC HANDLERS 
+         **/
+
+        // Rule 4: Single Non-English -> Translate whole thing to English
+        if (type === "SINGLE_NON_EN" && detectedLangs[0] !== 'en') {
+            const translation = await apiTranslate(finalNarrative, "en");
+            finalNarrative = `${finalNarrative}\n\n---\nTranslation (English):\n${translation}`;
         }
 
-        const narrativeText = narrativeMatch ? narrativeMatch[1].trim() : rawText;
+        // Rule 6 & 7: Multilingual (2 or 3 languages)
+        if (type === "MULTILINGUAL" && detectedLangs.length >= 2) {
+            // Requirement: Translate the "Dominant Block" into the least used language.
+            const leastUsedLang = detectedLangs[detectedLangs.length - 1];
+            const translation = await apiTranslate(finalNarrative, leastUsedLang);
+            finalNarrative = `${finalNarrative}\n\n---\nTranslation (${leastUsedLang}):\n${translation}`;
+        }
 
         return {
-            text: narrativeText,
+            text: finalNarrative,
             detectedLangs: detectedLangs
         };
     });
 };
 
-export const apiTranslate = async (
-    text: string,
-    targetLang: string = 'en' // Fallback to English
-): Promise<string> => {
+export const apiTranslate = async (text: string, targetLang: string): Promise<string> => {
     return withRetry(async () => {
         const ai = getClient(process.env.GEMINI_FLASH_API_KEY, 'GEMINI_FLASH_API_KEY');
         const model = ai.getGenerativeModel({ model: CONFIG.translationModel });
-
-        const prompt = `Translate the following text into the language with ISO code "${targetLang}". 
-Keep the tone natural and preserve the meaning of both the image description and the extracted text. 
-Return ONLY the translated text:
-
-"${text}"`;
+        const prompt = `Translate the following text into the language with ISO code ${targetLang}. 
+        Return ONLY the translated text without extra commentary: "${text}"`;
         
-        const result = await model.generateContent(prompt);
-        return result.response.text().trim() || text;
+        const response = await model.generateContent(prompt);
+        return response.response.text().trim();
     });
 };
 
-export const apiGenerateSpeech = async (
-    text: string
-): Promise<Blob> => {
-    if (!text || text.trim().length === 0) {
-        throw new Error("Cannot generate speech: input text is empty.");
-    }
-
+export const apiGenerateSpeech = async (text: string): Promise<Blob> => {
+    if (!text) throw new Error("Empty text");
     return withRetry(async () => {
         const ai = getClient(process.env.GEMINI_TTS_API_KEY, 'GEMINI_TTS_API_KEY');
         const model = ai.getGenerativeModel({ model: CONFIG.audioModel });
         
-        // Note: Check Gemini 2.0+ documentation for specific TTS structure
-        const result = await model.generateContent({
-            contents: [{ role: 'user', parts: [{ text: text }] }],
-            generationConfig: {
-                responseMimeType: "audio/wav", // Requesting specific format if supported
-            }
+        const response = await model.generateContent({
+            contents: [{ role: 'user', parts: [{ text }] }],
+            generationConfig: { responseModalities: ['AUDIO'] }
         });
 
-        // Use standard content fetching for the audio blob
-        const response = await result.response;
-        const audioPart = response.candidates?.[0].content.parts.find(p => p.inlineData);
-
-        if (!audioPart?.inlineData?.data) {
-            throw new Error("Audio generation failed. No audio data returned.");
-        }
-
-        return pcmToWav(audioPart.inlineData.data, 24000);
+        const pcmBase64 = response.response.candidates?.[0].content.parts[0].inlineData?.data;
+        if (!pcmBase64) throw new Error("Audio generation failed.");
+        return pcmToWav(pcmBase64, 24000);
     });
 };
