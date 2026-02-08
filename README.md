@@ -1,4 +1,4 @@
-# 🔮 Visionary
+# 👁️ Visionary
 
 <div align="center">
   <h3>Contextual Analysis & Narrator</h3>
