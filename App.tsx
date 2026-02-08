@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
 import { Eye, Sparkle, Copy } from 'phosphor-react';
 import { MediaInput } from './components/MediaInput';
 import { Visualizer } from './components/Visualizer';
