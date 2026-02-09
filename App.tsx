@@ -1,17 +1,21 @@
-
 import { useState } from 'react';
-import { Eye, Sparkle, Copy } from 'phosphor-react';
+import { Eye, Sparkle, Copy, Translate } from 'phosphor-react';
 import { MediaInput } from './components/MediaInput';
 import { Visualizer } from './components/Visualizer';
 import { ErrorBanner } from './components/ErrorBanner';
-import { apiAnalyzeAndDetect, apiGenerateSpeech } from './services/geminiService';
-import { AppStatus, ResultsMap } from './types';
+import { apiAnalyzeSource, apiTranslate, apiGenerateSpeech } from './services/geminiService';
+import { AppStatus, CachedData } from './types';
+
+const LANGUAGES = [
+    { code: 'my', name: 'Burmese' },
+    { code: 'en', name: 'English' },
+    { code: 'ja', name: 'Japanese' },
+];
 
 function App() {
     const [status, setStatus] = useState<AppStatus>('idle');
     const [statusText, setStatusText] = useState('Idle');
     
-    // Error State
     const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
     // File State
@@ -19,9 +23,14 @@ function App() {
     const [mimeType, setMimeType] = useState<string | null>(null);
     const [fileName, setFileName] = useState<string | null>(null);
 
-    // Results State
-    const [resultsMap, setResultsMap] = useState<ResultsMap>({});
-    const [selectedLanguage, setSelectedLanguage] = useState<string | null>(null);
+    // Cache State (stores Source and Translations for the current image)
+    const [cache, setCache] = useState<CachedData>({
+        source: null,
+        sourceAudio: null,
+        translations: {}
+    });
+
+    const [targetLangCode, setTargetLangCode] = useState<string>('en');
     
     // Audio State
     const [audioElement, setAudioElement] = useState<HTMLAudioElement | null>(null);
@@ -37,8 +46,12 @@ function App() {
         setFileData(null);
         setMimeType(null);
         setFileName(null);
-        setResultsMap({});
-        setSelectedLanguage(null);
+        // Clear cache explicitly when image is removed
+        setCache({
+            source: null,
+            sourceAudio: null,
+            translations: {}
+        });
         setStatus('idle');
         setStatusText('Idle');
         setErrorMessage(null);
@@ -51,100 +64,16 @@ function App() {
         setFileName(name || 'Uploaded File');
     };
 
-    const processWorkflow = async () => {
-        if (!fileData || !mimeType) return;
-
-        setStatus('processing');
-        setStatusText('Analyzing content...');
-        setResultsMap({}); // clear old results
-        setErrorMessage(null);
-
-        try {
-            // 1. Vision Analysis (Rules 1-8 logic in service)
-            const analysis = await apiAnalyzeAndDetect(fileData, mimeType);
-            
-            const newResults: ResultsMap = {};
-            
-            // 1a. Primary Content (The Source Language Tag: OCR + Description)
-            // If it's pure visual (en), analysis.primaryLabel will be "English"
-            const primaryKey = analysis.detectedLanguage === 'unknown' ? 'main' : analysis.detectedLanguage;
-            
-            newResults[primaryKey] = {
-                label: `${analysis.primaryLabel} (Source)`,
-                text: analysis.primaryContent,
-                audioBlob: null
-            };
-
-            // 1b. Translations
-            if (analysis.translations.en) {
-                newResults['en'] = {
-                    label: 'English (Translation)',
-                    text: analysis.translations.en,
-                    audioBlob: null
-                };
-            }
-            if (analysis.translations.my) {
-                newResults['my'] = {
-                    label: 'Burmese (Translation)',
-                    text: analysis.translations.my,
-                    audioBlob: null
-                };
-            }
-
-            setResultsMap(newResults);
-
-            // 2. Generate Speech for each tab independently
-            // Requirement: Send Full text (OCR+Description formatted as a one passage) to the Voice Model 
-            // for both source and translated languages respectively.
-            
-            const keys = Object.keys(newResults);
-            
-            for (const key of keys) {
-                const item = newResults[key];
-                if (!item.text) continue;
-
-                // Send the specific text for this language (OCR+Description) to the voice model
-                const textForSpeech = item.text;
-
-                setStatusText(`Generating audio for ${item.label}...`);
-                try {
-                    const blob = await apiGenerateSpeech(textForSpeech);
-                    newResults[key].audioBlob = blob;
-                    // Update state incrementally
-                    setResultsMap({ ...newResults });
-                } catch (e: any) {
-                    console.warn(`Failed to generate speech for ${key}:`, e.message);
-                }
-            }
-
-            // Finish
-            // Default to primary key
-            setSelectedLanguage(primaryKey);
-            selectLanguage(primaryKey, newResults);
-            setStatus('idle');
-            setStatusText('Ready');
-            
-        } catch (error: any) {
-            console.error("Workflow Error:", error);
-            setStatus('idle');
-            setStatusText('Error');
-            setErrorMessage(error.message || "An unexpected error occurred. Please try again.");
-        }
-    };
-
-    const selectLanguage = (key: string, map = resultsMap) => {
-        setSelectedLanguage(key);
-        const item = map[key];
-        
-        // Always stop current audio when switching tabs
+    // Helper to play audio blob
+    const playAudioBlob = (blob: Blob | null) => {
         if (audioElement) {
             audioElement.pause();
             setAudioElement(null);
             setIsPlaying(false);
         }
 
-        if (item && item.audioBlob) {
-            const url = URL.createObjectURL(item.audioBlob);
+        if (blob) {
+            const url = URL.createObjectURL(blob);
             const audio = new Audio(url);
             audio.onended = () => {
                 setIsPlaying(false);
@@ -152,63 +81,178 @@ function App() {
                 setStatusText('Finished');
             };
             setAudioElement(audio);
-            // We do not auto-play on tab switch, only on initial load (handled implicitly via selectLanguage call in processWorkflow)
-            // However, since selectLanguage is called at the end of processWorkflow, it will set the audio.
-            // We can check if status is processing/analyzing to trigger auto-play if needed, or just let user play.
-            // To match previous behavior of auto-playing the first result:
-            if (status === 'processing' || statusText === 'Ready') {
-                 audio.play().then(() => {
-                    setIsPlaying(true);
-                    setStatus('playing');
-                    setStatusText('Speaking...');
-                 }).catch(e => console.log("Auto-play blocked or failed", e));
+            audio.play().then(() => {
+                setIsPlaying(true);
+                setStatus('playing');
+                setStatusText('Speaking...');
+            }).catch(e => console.log("Auto-play blocked", e));
+        }
+    };
+
+    // Step 1: Initial Source Analysis
+    const performSourceAnalysis = async () => {
+        if (!fileData || !mimeType) return;
+
+        setErrorMessage(null);
+        setStatus('processing');
+        
+        try {
+            // Check cache first (though button usually hidden if cached)
+            if (cache.source && cache.sourceAudio) {
+                playAudioBlob(cache.sourceAudio);
+                return;
             }
-        } else {
-             setAudioElement(null);
+
+            setStatusText('Analyzing visual content...');
+            // 1. Analyze Source
+            const analysis = await apiAnalyzeSource(fileData, mimeType);
+            
+            // 2. Generate Source Audio
+            setStatusText(`Generating audio (${analysis.primaryLabel})...`);
+            const audio = await apiGenerateSpeech(analysis.sourceText);
+
+            // 3. Save to Cache
+            setCache(prev => ({
+                ...prev,
+                source: analysis,
+                sourceAudio: audio
+            }));
+
+            // Set target language to source language initially so the UI reflects "Original" state
+            // If the detected language isn't in our list, we might want to handle that, 
+            // but for now, setting it allows us to know we are in "Source" mode if we match logic.
+            setTargetLangCode(analysis.detectedLanguage);
+
+            // 4. Play Source Audio
+            setStatus('idle');
+            setStatusText('Ready');
+            playAudioBlob(audio);
+
+        } catch (error: any) {
+            console.error("Analysis Error:", error);
+            setStatus('idle');
+            setStatusText('Error');
+            setErrorMessage(error.message || "Failed to analyze image.");
+        }
+    };
+
+    // Step 2: Translation (Triggered by user selection)
+    const handleTranslation = async (newLangCode: string) => {
+        // Update selection state immediately
+        setTargetLangCode(newLangCode);
+
+        // If no source analyzed yet, do nothing (should not happen due to UI hiding)
+        if (!cache.source) return;
+
+        // If selecting the source language, just play source audio
+        if (newLangCode === cache.source.detectedLanguage) {
+            playAudioBlob(cache.sourceAudio);
+            return;
+        }
+
+        // Check Cache for this translation
+        if (cache.translations[newLangCode]) {
+            playAudioBlob(cache.translations[newLangCode].audio);
+            return;
+        }
+
+        // Perform Translation
+        setErrorMessage(null);
+        setStatus('processing');
+        
+        try {
+            const targetLangName = LANGUAGES.find(l => l.code === newLangCode)?.name || newLangCode;
+            
+            setStatusText(`Translating to ${targetLangName}...`);
+            const translatedText = await apiTranslate(cache.source.sourceText, targetLangName);
+
+            setStatusText(`Generating audio (${targetLangName})...`);
+            const translatedAudio = await apiGenerateSpeech(translatedText);
+
+            // Save to Cache
+            setCache(prev => ({
+                ...prev,
+                translations: {
+                    ...prev.translations,
+                    [newLangCode]: {
+                        text: translatedText,
+                        audio: translatedAudio
+                    }
+                }
+            }));
+
+            setStatus('idle');
+            setStatusText('Ready');
+            playAudioBlob(translatedAudio);
+
+        } catch (error: any) {
+            console.error("Translation Error:", error);
+            setStatus('idle');
+            setStatusText('Error');
+            setErrorMessage(error.message || "Failed to translate.");
         }
     };
 
     const togglePlayback = () => {
-        if (!audioElement) {
-            // Re-create if missing (e.g. after stop)
-            const item = selectedLanguage ? resultsMap[selectedLanguage] : null;
-            if (item && item.audioBlob) {
-               const url = URL.createObjectURL(item.audioBlob);
-               const audio = new Audio(url);
-               audio.onended = () => {
-                   setIsPlaying(false);
-                   setStatus('idle');
-                   setStatusText('Finished');
-               };
-               setAudioElement(audio);
-               audio.play();
-               setIsPlaying(true);
-               setStatus('playing');
-               setStatusText('Speaking...');
+        if (!audioElement && cache.source) {
+            // If no active audio but we have content, replay current view
+             const isSource = targetLangCode === cache.source.detectedLanguage;
+             if (isSource) {
+                 playAudioBlob(cache.sourceAudio);
+             } else {
+                 const trans = cache.translations[targetLangCode];
+                 if (trans) playAudioBlob(trans.audio);
+             }
+             return;
+        }
+
+        if (audioElement) {
+            if (audioElement.paused) {
+                audioElement.play();
+                setIsPlaying(true);
+                setStatus('playing');
+                setStatusText('Speaking...');
+            } else {
+                audioElement.pause();
+                setIsPlaying(false);
+                setStatus('paused');
+                setStatusText('Paused');
             }
-            return;
         }
+    };
 
-        if (audioElement.paused) {
-            audioElement.play();
-            setIsPlaying(true);
-            setStatus('playing');
-            setStatusText('Speaking...');
+    // Determine what text/label to display
+    const getDisplayData = () => {
+        if (!cache.source) return null;
+
+        const isSourceSameAsTarget = cache.source.detectedLanguage === targetLangCode;
+        
+        if (isSourceSameAsTarget) {
+            return {
+                label: `${cache.source.primaryLabel} (Original)`,
+                text: cache.source.sourceText,
+                isAudioReady: !!cache.sourceAudio
+            };
         } else {
-            audioElement.pause();
-            setIsPlaying(false);
-            setStatus('paused');
-            setStatusText('Paused');
+            const trans = cache.translations[targetLangCode];
+            const langName = LANGUAGES.find(l => l.code === targetLangCode)?.name;
+            if (trans) {
+                return {
+                    label: `${langName} (Translation)`,
+                    text: trans.text,
+                    isAudioReady: !!trans.audio
+                };
+            }
+            // If we are here, it means we are waiting for translation or processing it
+            return {
+                label: `Translating to ${langName}...`,
+                text: "...",
+                isAudioReady: false
+            };
         }
     };
 
-    const copyText = () => {
-        if (selectedLanguage && resultsMap[selectedLanguage]) {
-            navigator.clipboard.writeText(resultsMap[selectedLanguage].text);
-        }
-    };
-
-    const currentResult = selectedLanguage ? resultsMap[selectedLanguage] : null;
+    const displayData = getDisplayData();
 
     return (
         <div className="flex flex-col items-center py-6 px-4 md:px-6 overflow-x-hidden w-full max-w-2xl mx-auto">
@@ -257,46 +301,75 @@ function App() {
                     )}
                 </div>
 
-                {/* Process Button */}
-                <button 
-                    onClick={processWorkflow}
-                    disabled={status === 'processing' || !fileData}
-                    className={`w-full py-4 rounded-2xl bg-white text-slate-900 font-bold text-sm tracking-wide shadow-[0_0_20px_rgba(255,255,255,0.2)] hover:scale-[1.02] transition-all duration-300 flex items-center justify-center gap-2 group ${
-                        (status === 'processing' || !fileData) ? 'opacity-50 cursor-not-allowed' : ''
-                    }`}
-                >
-                    <Sparkle weight="bold" /> Analyze & Narrate
-                </button>
+                {/* Process Button - Only show if we have data but NO source yet */}
+                {!cache.source && fileData && (
+                    <button 
+                        onClick={performSourceAnalysis}
+                        disabled={status === 'processing'}
+                        className={`w-full py-4 rounded-2xl bg-white text-slate-900 font-bold text-sm tracking-wide shadow-[0_0_20px_rgba(255,255,255,0.2)] hover:scale-[1.02] transition-all duration-300 flex items-center justify-center gap-2 group ${
+                            status === 'processing' ? 'opacity-50 cursor-not-allowed' : ''
+                        }`}
+                    >
+                        <Sparkle weight="bold" /> Analyze & Narrate
+                    </button>
+                )}
+
+                {/* Translation Selector - ONLY appear after source analysis is complete */}
+                {cache.source && (
+                    <div className="w-full animate-fade-in-down">
+                        <div className="w-full flex items-center justify-between bg-white/5 rounded-2xl p-3 border border-white/10">
+                            <div className="flex items-center gap-2 text-slate-400">
+                                <Translate size={20} />
+                                <span className="text-xs font-medium uppercase tracking-wider">Language:</span>
+                            </div>
+                            <select 
+                                value={targetLangCode}
+                                onChange={(e) => handleTranslation(e.target.value)}
+                                className="bg-slate-900 border border-slate-700 text-white text-sm rounded-lg focus:ring-primary focus:border-primary block p-2 outline-none min-w-[140px]"
+                                disabled={status === 'processing'}
+                            >
+                                {/* Option for the detected source language */}
+                                <option value={cache.source.detectedLanguage}>
+                                    {cache.source.primaryLabel} (Original)
+                                </option>
+                                
+                                {/* Separator */}
+                                <option disabled>──────────</option>
+
+                                {/* Target Languages - Filter out source language if present */}
+                                {LANGUAGES
+                                    .filter(lang => lang.code !== cache.source?.detectedLanguage)
+                                    .map((lang) => (
+                                    <option key={lang.code} value={lang.code}>
+                                        {lang.name}
+                                    </option>
+                                ))}
+                            </select>
+                        </div>
+                    </div>
+                )}
 
                 {/* Results Area */}
-                {Object.keys(resultsMap).length > 0 && currentResult && (
+                {displayData && (
                     <div className="glass-panel rounded-2xl p-6 border-l-4 border-l-primary animate-fade-in-down">
                         <div className="flex justify-between items-center mb-3">
                             <span className="text-xs font-bold text-primary uppercase tracking-widest">
-                                {currentResult.label}
+                                {displayData.label}
                             </span>
-                            <div className="flex items-center gap-4">
-                                <select 
-                                    value={selectedLanguage || ''} 
-                                    onChange={(e) => selectLanguage(e.target.value)}
-                                    className="bg-slate-800 border border-slate-700 rounded-md px-2 py-1 text-xs text-white focus:border-primary outline-none max-w-[150px]"
-                                >
-                                    {Object.keys(resultsMap).map(key => (
-                                        <option key={key} value={key}>{resultsMap[key].label}</option>
-                                    ))}
-                                </select>
-                                <button onClick={copyText} className="text-slate-400 hover:text-white text-xs flex items-center gap-1">
-                                    <Copy weight="bold" /> Copy
-                                </button>
-                            </div>
+                            <button 
+                                onClick={() => navigator.clipboard.writeText(displayData.text)} 
+                                className="text-slate-400 hover:text-white text-xs flex items-center gap-1"
+                            >
+                                <Copy weight="bold" /> Copy
+                            </button>
                         </div>
                         <p className="text-sm text-slate-300 leading-relaxed font-sans whitespace-pre-wrap max-h-64 overflow-y-auto scrollbar-hide">
-                            {currentResult.text}
+                            {displayData.text}
                         </p>
                         <div className="mt-4 text-right border-t border-white/5 pt-2">
                             <div className="flex justify-between items-center">
                                 <span className="text-[10px] text-slate-500">
-                                    {resultsMap[selectedLanguage || '']?.audioBlob ? "Audio Ready" : "Text Only"}
+                                    {displayData.isAudioReady ? "Audio Ready" : "Processing..."}
                                 </span>
                                 <div>
                                     <p className="text-[10px] text-slate-400 uppercase tracking-wider">Voice Model</p>
