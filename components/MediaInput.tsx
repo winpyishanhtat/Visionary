@@ -1,5 +1,5 @@
 import React, { useRef, useState } from 'react';
-import { Camera, Trash, Aperture, UploadSimple, FileText } from 'phosphor-react';
+import { Camera, Trash, Aperture, UploadSimple, FileText, X } from 'phosphor-react';
 
 interface MediaInputProps {
     onFileSelect: (base64: string, mimeType: string, fileName?: string) => void;
@@ -120,7 +120,7 @@ export const MediaInput: React.FC<MediaInputProps> = ({ onFileSelect, onClear, f
                         onClick={isCameraActive ? toggleCamera : onClear} 
                         className="p-3 rounded-xl bg-slate-900/80 border border-white/10 text-red-400 hover:text-red-300 hover:bg-red-500/10 backdrop-blur-md transition"
                     >
-                        {isCameraActive ? <XIcon /> : <Trash weight="bold" />}
+                        {isCameraActive ? <X weight="bold" /> : <Trash weight="bold" />}
                     </button>
                 )}
                 
@@ -140,14 +140,6 @@ export const MediaInput: React.FC<MediaInputProps> = ({ onFileSelect, onClear, f
                     </button>
                 )}
             </div>
-            
-            {/* Scan Animation Overlay - Active during processing only, but handled by parent mostly. 
-                For now we just keep the structure if needed, or pass a prop 'isScanning'.
-             */}
         </div>
     );
 };
-
-const XIcon = () => (
-    <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" fill="currentColor" viewBox="0 0 256 256"><path d="M205.66,194.34a8,8,0,0,1-11.32,11.32L128,139.31,61.66,205.66a8,8,0,0,1-11.32-11.32L116.69,128,50.34,61.66A8,8,0,0,1,61.66,50.34L128,116.69l66.34-66.35a8,8,0,0,1,11.32,11.32L139.31,128Z"></path></svg>
-);

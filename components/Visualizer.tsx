@@ -51,7 +51,7 @@ export const Visualizer: React.FC<VisualizerProps> = ({
             source.connect(ctx.destination);
             sourceRef.current = source;
         } catch (e) {
-            console.warn("Audio source connection error (harmless if re-initializing):", e);
+            // Reconnecting to same element can throw, usually fine
         }
 
         return () => {
