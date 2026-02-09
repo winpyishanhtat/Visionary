@@ -11,14 +11,18 @@ export interface ResultsMap {
 
 export type AppStatus = 'idle' | 'processing' | 'playing' | 'paused';
 
-export interface AnalysisResponse {
+// Result from the initial image analysis
+export interface SourceAnalysisResult {
     hasText: boolean;
-    detectedLanguage: string; // 'en', 'my', 'ja', etc.
-    // The combined OCR (with transliteration) + Visual Description in source language
-    primaryContent: string; 
-    primaryLabel: string; // e.g., "English", "Burmese", "Japanese"
-    translations: {
-        en?: string;
-        my?: string;
-    };
+    detectedLanguage: string; // ISO code of the dominant language found in image
+    primaryLabel: string; // "Burmese", "English", etc.
+    // The combined OCR (with mixed-script transliteration) + Visual Description in DOMINANT language
+    sourceText: string; 
+}
+
+export interface CachedData {
+    source: SourceAnalysisResult | null;
+    sourceAudio: Blob | null;
+    // Cache for translations: key = langCode, value = { text, audio }
+    translations: Record<string, { text: string; audio: Blob | null }>;
 }
