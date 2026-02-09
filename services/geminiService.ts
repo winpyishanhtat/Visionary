@@ -186,7 +186,7 @@ export const apiGenerateSpeech = async (text: string): Promise<Blob> => {
         responseModalities: [Modality.AUDIO],
         speechConfig: {
           voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: "Kore" }
+            prebuiltVoiceConfig: { voiceName: "Aoede" }
           }
         }
       }
